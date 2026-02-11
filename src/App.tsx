@@ -104,7 +104,6 @@ function App() {
   };
 
   const activeAgents = sessions.filter(s => s.status === 'running').length;
-  const completedAgents = sessions.filter(s => s.status === 'completed').length;
 
   if (loading) {
     return (
