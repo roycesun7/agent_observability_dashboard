@@ -1,6 +1,6 @@
 /**
  * Simple API server to serve OpenClaw session data.
- * Reads from the JSONL transcript files.
+ * Reads from the JSONL transcript files (including deleted/archived).
  */
 
 import express from 'express';
@@ -17,11 +17,22 @@ const SESSIONS_DIR = process.env.SESSIONS_DIR ||
   path.join(process.env.HOME, '.openclaw/agents/main/sessions');
 
 /**
+ * Extract session ID from filename (handles .deleted suffix)
+ */
+function extractSessionId(filename) {
+  // Handle: abc123.jsonl or abc123.jsonl.deleted.2026-02-11...
+  const match = filename.match(/^([a-f0-9-]+)\.jsonl/);
+  return match ? match[1] : filename;
+}
+
+/**
  * Parse a JSONL file and extract session info
  */
 async function parseSessionFile(filePath) {
   const stats = fs.statSync(filePath);
-  const sessionId = path.basename(filePath, '.jsonl');
+  const filename = path.basename(filePath);
+  const sessionId = extractSessionId(filename);
+  const isDeleted = filename.includes('.deleted');
   
   const lines = [];
   const fileStream = fs.createReadStream(filePath);
@@ -69,13 +80,21 @@ async function parseSessionFile(filePath) {
     }
   }
 
-  // Check for labels in spawn events
+  // Check for labels in spawn events or task field
   let label = 'Main';
   const spawnLine = lines.find(l => l.type === 'custom' && l.data?.label);
   if (spawnLine?.data?.label) {
     label = spawnLine.data.label;
   } else if (sessionKey.includes('subagent')) {
-    label = 'Sub-agent';
+    // Try to find task description
+    const taskLine = lines.find(l => l.type === 'message' && l.message?.content?.[0]?.text?.includes('Your Task'));
+    if (taskLine) {
+      const text = taskLine.message.content[0].text;
+      const taskMatch = text.match(/label['":\s]+([^'"}\n]+)/i);
+      label = taskMatch ? taskMatch[1].trim() : 'Sub-agent';
+    } else {
+      label = 'Sub-agent';
+    }
   }
 
   // Check for model in model-snapshot events
@@ -85,9 +104,11 @@ async function parseSessionFile(filePath) {
   }
 
   // Determine status
-  let status = 'idle';
-  if (totalTokens > 0) {
+  let status = isDeleted ? 'archived' : 'idle';
+  if (totalTokens > 0 && !isDeleted) {
     status = lastStatus;
+  } else if (isDeleted) {
+    status = 'archived';
   }
 
   return {
@@ -102,6 +123,7 @@ async function parseSessionFile(filePath) {
     lastUpdated: stats.mtime.toISOString(),
     createdAt: stats.birthtime.toISOString(),
     filePath,
+    isDeleted,
   };
 }
 
@@ -110,11 +132,17 @@ async function parseSessionFile(filePath) {
  */
 app.get('/api/sessions', async (req, res) => {
   try {
-    const activeMinutes = parseInt(req.query.activeMinutes) || 60;
+    const activeMinutes = parseInt(req.query.activeMinutes) || 1440; // Default 24h
+    const includeArchived = req.query.includeArchived !== 'false'; // Default true
     const cutoff = Date.now() - (activeMinutes * 60 * 1000);
     
     const files = fs.readdirSync(SESSIONS_DIR)
-      .filter(f => f.endsWith('.jsonl'));
+      .filter(f => {
+        if (f.endsWith('.jsonl')) return true;
+        if (includeArchived && f.includes('.jsonl.deleted')) return true;
+        return false;
+      })
+      .filter(f => !f.endsWith('.lock') && !f.endsWith('.json'));
     
     const sessions = [];
     
@@ -150,10 +178,18 @@ app.get('/api/sessions', async (req, res) => {
  */
 app.get('/api/sessions/:sessionId', async (req, res) => {
   try {
-    const filePath = path.join(SESSIONS_DIR, `${req.params.sessionId}.jsonl`);
+    // Try active file first, then deleted
+    let filePath = path.join(SESSIONS_DIR, `${req.params.sessionId}.jsonl`);
     
     if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'Session not found' });
+      // Look for deleted version
+      const files = fs.readdirSync(SESSIONS_DIR);
+      const deletedFile = files.find(f => f.startsWith(`${req.params.sessionId}.jsonl.deleted`));
+      if (deletedFile) {
+        filePath = path.join(SESSIONS_DIR, deletedFile);
+      } else {
+        return res.status(404).json({ error: 'Session not found' });
+      }
     }
     
     const session = await parseSessionFile(filePath);
@@ -169,12 +205,13 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
 app.get('/api/stats', async (req, res) => {
   try {
     const files = fs.readdirSync(SESSIONS_DIR)
-      .filter(f => f.endsWith('.jsonl'));
+      .filter(f => f.includes('.jsonl') && !f.endsWith('.lock') && !f.endsWith('.json'));
     
     let totalTokens = 0;
     let totalCost = 0;
-    let totalSessions = files.length;
+    let totalSessions = 0;
     let activeToday = 0;
+    let archivedCount = 0;
     
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -182,6 +219,10 @@ app.get('/api/stats', async (req, res) => {
     for (const file of files) {
       const filePath = path.join(SESSIONS_DIR, file);
       const stats = fs.statSync(filePath);
+      const isDeleted = file.includes('.deleted');
+      
+      totalSessions++;
+      if (isDeleted) archivedCount++;
       
       if (stats.mtime >= today) {
         activeToday++;
@@ -199,6 +240,8 @@ app.get('/api/stats', async (req, res) => {
     res.json({
       totalSessions,
       activeToday,
+      archivedCount,
+      activeSessions: totalSessions - archivedCount,
       totalTokens,
       totalCost,
       timestamp: new Date().toISOString(),
