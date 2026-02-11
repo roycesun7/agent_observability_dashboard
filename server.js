@@ -17,6 +17,33 @@ const SESSIONS_DIR = process.env.SESSIONS_DIR ||
   path.join(process.env.HOME, '.openclaw/agents/main/sessions');
 
 /**
+ * Load session metadata from sessions.json
+ */
+function loadSessionsIndex() {
+  const indexPath = path.join(SESSIONS_DIR, 'sessions.json');
+  try {
+    if (fs.existsSync(indexPath)) {
+      const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+      // Build a map of sessionId -> metadata
+      const index = {};
+      for (const [key, val] of Object.entries(data)) {
+        if (val.sessionId) {
+          index[val.sessionId] = {
+            sessionKey: key,
+            label: val.label || (key.includes('subagent') ? 'Sub-agent' : 'Main'),
+            isSubagent: key.includes('subagent'),
+          };
+        }
+      }
+      return index;
+    }
+  } catch (e) {
+    console.error('Error loading sessions.json:', e.message);
+  }
+  return {};
+}
+
+/**
  * Extract session ID from filename (handles .deleted suffix)
  */
 function extractSessionId(filename) {
@@ -28,11 +55,14 @@ function extractSessionId(filename) {
 /**
  * Parse a JSONL file and extract session info
  */
-async function parseSessionFile(filePath) {
+async function parseSessionFile(filePath, sessionsIndex = {}) {
   const stats = fs.statSync(filePath);
   const filename = path.basename(filePath);
   const sessionId = extractSessionId(filename);
   const isDeleted = filename.includes('.deleted');
+  
+  // Get metadata from sessions.json index
+  const indexData = sessionsIndex[sessionId] || {};
   
   const lines = [];
   const fileStream = fs.createReadStream(filePath);
@@ -80,21 +110,13 @@ async function parseSessionFile(filePath) {
     }
   }
 
-  // Check for labels in spawn events or task field
-  let label = 'Main';
-  const spawnLine = lines.find(l => l.type === 'custom' && l.data?.label);
-  if (spawnLine?.data?.label) {
-    label = spawnLine.data.label;
-  } else if (sessionKey.includes('subagent')) {
-    // Try to find task description
-    const taskLine = lines.find(l => l.type === 'message' && l.message?.content?.[0]?.text?.includes('Your Task'));
-    if (taskLine) {
-      const text = taskLine.message.content[0].text;
-      const taskMatch = text.match(/label['":\s]+([^'"}\n]+)/i);
-      label = taskMatch ? taskMatch[1].trim() : 'Sub-agent';
-    } else {
-      label = 'Sub-agent';
-    }
+  // Get label from sessions.json index first, fallback to detection
+  let label = indexData.label || 'Main';
+  const isSubagent = indexData.isSubagent || sessionKey.includes('subagent');
+  
+  // If no label from index, try to detect
+  if (label === 'Main' && isSubagent) {
+    label = 'Sub-agent';
   }
 
   // Check for model in model-snapshot events
@@ -113,7 +135,7 @@ async function parseSessionFile(filePath) {
 
   return {
     sessionId,
-    sessionKey,
+    sessionKey: indexData.sessionKey || sessionKey,
     label,
     model,
     totalTokens,
@@ -124,6 +146,7 @@ async function parseSessionFile(filePath) {
     createdAt: stats.birthtime.toISOString(),
     filePath,
     isDeleted,
+    isSubagent,
   };
 }
 
@@ -135,6 +158,9 @@ app.get('/api/sessions', async (req, res) => {
     const activeMinutes = parseInt(req.query.activeMinutes) || 1440; // Default 24h
     const includeArchived = req.query.includeArchived !== 'false'; // Default true
     const cutoff = Date.now() - (activeMinutes * 60 * 1000);
+    
+    // Load sessions index for labels
+    const sessionsIndex = loadSessionsIndex();
     
     const files = fs.readdirSync(SESSIONS_DIR)
       .filter(f => {
@@ -154,7 +180,7 @@ app.get('/api/sessions', async (req, res) => {
       if (stats.mtime.getTime() < cutoff) continue;
       
       try {
-        const session = await parseSessionFile(filePath);
+        const session = await parseSessionFile(filePath, sessionsIndex);
         sessions.push(session);
       } catch (e) {
         console.error(`Error parsing ${file}:`, e.message);
@@ -178,6 +204,8 @@ app.get('/api/sessions', async (req, res) => {
  */
 app.get('/api/sessions/:sessionId', async (req, res) => {
   try {
+    const sessionsIndex = loadSessionsIndex();
+    
     // Try active file first, then deleted
     let filePath = path.join(SESSIONS_DIR, `${req.params.sessionId}.jsonl`);
     
@@ -192,7 +220,7 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
       }
     }
     
-    const session = await parseSessionFile(filePath);
+    const session = await parseSessionFile(filePath, sessionsIndex);
     res.json(session);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -204,6 +232,7 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
  */
 app.get('/api/stats', async (req, res) => {
   try {
+    const sessionsIndex = loadSessionsIndex();
     const files = fs.readdirSync(SESSIONS_DIR)
       .filter(f => f.includes('.jsonl') && !f.endsWith('.lock') && !f.endsWith('.json'));
     
@@ -229,7 +258,7 @@ app.get('/api/stats', async (req, res) => {
       }
       
       try {
-        const session = await parseSessionFile(filePath);
+        const session = await parseSessionFile(filePath, sessionsIndex);
         totalTokens += session.totalTokens;
         totalCost += session.totalCost;
       } catch (e) {

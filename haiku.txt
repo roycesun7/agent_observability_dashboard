@@ -1,0 +1,3 @@
+Blinking status lights
+Agents watch agents watching
+Recursive gaze loops
